@@ -5,6 +5,9 @@ import { redirect } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
 import { db, isAdmin } from '@/lib/supabase';
 import { validLanguage } from '@/lib/config';
+import { headers } from 'next/headers';
+import { createClient } from '@supabase/supabase-js';
+import { createHmac } from 'node:crypto';
 
 const str = (f: FormData, k: string) =>
     String(f.get(k) || '').trim();
@@ -12,6 +15,7 @@ const str = (f: FormData, k: string) =>
 function articlePath(lang: string, slug: string) {
     return `/${lang}/${encodeURIComponent(slug)}`;
 }
+
 
 // CONNEXION ADMINISTRATEUR
 export async function login(form: FormData) {
@@ -44,73 +48,107 @@ export async function logout() {
 }
 
 // AJOUT D'UN COMMENTAIRE
+
 export async function addComment(form: FormData) {
     const lang = str(form, 'lang');
     const slug = str(form, 'slug');
 
     if (!validLanguage(lang)) return;
 
-    const path = articlePath(lang, slug);
+    const path = `/${lang}/${encodeURIComponent(slug)}`;
 
-    // Champ honeypot anti-spam
+    // Champ invisible anti-robot
     if (str(form, 'website')) {
         redirect(path + '?sent=1');
     }
 
     const nickname = str(form, 'nickname');
-    const body = str(form, 'body');
+    const content = str(form, 'body');
     const articleId = str(form, 'post_id');
 
+    // Validation du formulaire
     if (
+        !/^[a-z0-9-]{3,100}$/.test(slug) ||
+        !/^[0-9a-f-]{36}$/i.test(articleId) ||
         nickname.length > 48 ||
-        body.length < 2 ||
-        body.length > 2000 ||
-        !articleId
+        content.length < 2 ||
+        content.length > 2000
     ) {
         redirect(path + '?error=invalid');
     }
 
-    const s = await db();
-
-    if (!s) redirect(path + '?error=demo');
-
-    // Vérifier que l'article existe et qu'il est publié.
-    const { data: article, error: articleError } = await s
-        .from('articles')
-        .select('id, blogs!inner(slug)')
-        .eq('id', articleId)
-        .eq('slug', slug)
-        .eq('status', 'published')
-        .eq('blogs.slug', lang)
-        .maybeSingle();
-
-    if (articleError || !article) {
+    // Maximum 2 liens dans un commentaire
+    const links = content.match(/https?:\/\/|www\./gi) || [];
+    if (links.length > 2) {
         redirect(path + '?error=invalid');
     }
 
-    // Utiliser le client serveur autorisé pour
-    // l'insertion anonyme, jamais une clé secrète
-    // exposée au navigateur.
-    const { error } = await s.from('comments').insert({
-        article_id: article.id,
-        nickname: nickname || null,
-        content: body,
-        status: 'pending',
-    });
+    // Lecture de l'adresse IP depuis Vercel
+    const h = await headers();
 
-    if (error) {
-        console.error('ERREUR SUPABASE COMMENTAIRE:', {
-            message: error.message,
-            code: error.code,
-            details: error.details,
-            hint: error.hint,
-        });
+    const ip = h.get('x-forwarded-for')
+        ?.split(',')[0]
+        ?.trim();
+
+    if (!ip) {
+        redirect(path + '?error=submit');
     }
 
-    redirect(
-        path + (error ? '?error=submit' : '?sent=1')
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const secret = process.env.SUPABASE_SECRET_KEY;
+    const salt = process.env.COMMENT_RATE_LIMIT_SALT;
+
+    if (!url || !secret || !salt) {
+        console.error('Missing comment security configuration');
+        redirect(path + '?error=submit');
+    }
+
+    // Ne jamais enregistrer l'IP en clair dans Supabase
+    const ipHash = createHmac('sha256', salt)
+        .update(ip)
+        .digest('hex');
+
+    // Client Supabase privé, utilisé côté serveur
+    const adminDb = createClient(url, secret, {
+        auth: {
+            persistSession: false,
+            autoRefreshToken: false,
+            detectSessionInUrl: false,
+        },
+    });
+
+    const { data, error } = await adminDb.rpc(
+        'submit_comment_limited',
+        {
+            p_article_id: articleId,
+            p_language: lang,
+            p_slug: slug,
+            p_nickname: nickname,
+            p_content: content,
+            p_ip_hash: ipHash,
+        }
     );
+
+    if (error) {
+        console.error('Comment submission error:', error.message);
+        redirect(path + '?error=submit');
+    }
+
+    if (data === 'rate') {
+        redirect(path + '?error=rate');
+    }
+
+    if (data === 'invalid') {
+        redirect(path + '?error=invalid');
+    }
+
+    if (data !== 'ok') {
+        redirect(path + '?error=submit');
+    }
+
+    redirect(path + '?sent=1');
 }
+
 
 // CRÉATION ET MODIFICATION D'ARTICLE
 export async function savePost(form: FormData) {
